@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hime Rust Review"
+  short_description: "Rustの副作用と参照透過性をhimeで検査し、診断をレビュー"
+  default_prompt: "$hime-review を使って、このRustプロジェクトの副作用と参照透過性をレビューしてください。"

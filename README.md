@@ -149,6 +149,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## エージェントスキルとして使う
+
+[skills/hime-review](skills/hime-review/SKILL.md)は、himeの解析結果をソースと照合してレビューするスキルです。`SKILL.md`に対応し、ローカルCLIを実行できるエージェントで利用できます。
+
+### Codexへのインストール
+
+このリポジトリのルートで次を実行します。hime CLIとスキルをユーザー用にインストールするため、他のRustプロジェクトでも利用できます。既存の同名スキルがある場合は、内容を確認してから更新してください。
+
+```bash
+cargo install --path . --locked
+mkdir -p ~/.agents/skills
+cp -R skills/hime-review ~/.agents/skills/
+```
+
+hime CLIは通常`~/.cargo/bin/hime`に配置されます。`hime --help`で確認できます。PATHにない場合も、このスキルは`~/.cargo/bin/hime`を確認します。
+
+`~/.codex/skills`を使う環境では、そのディレクトリへスキルをコピーしてください。プロジェクト内だけで使う場合は、対象プロジェクトの`.agents/skills/hime-review`へ配置できます。配置場所の詳細は[Codexの公式スキルガイド](https://learn.chatgpt.com/docs/build-skills)を参照してください。
+
+### 呼び出し方
+
+解析したいRustプロジェクトをCodexで開き、プロンプトで`$hime-review`を指定します。
+
+```text
+$hime-review このRustプロジェクトの副作用と参照透過性をレビューして
+```
+
+特定のファイルの検査や、改善の実装も指定できます。
+
+```text
+$hime-review src/lib.rs の副作用を調べて
+$hime-review crates/core/src を検査して、計算とI/Oを分離できる箇所を改善して
+```
+
+対象を指定しない場合は、現在のプロジェクトの`src`を検査します。スキル一覧に表示されない場合は、Codexを再起動してください。
+
+### スキルの動作
+
+スキルはhimeのJSON出力を読み、検査範囲・各状態の件数・重要な診断をソースと照合して報告します。`candidate`を純粋性の証明とせず、`unknown`も実際の副作用と区別して扱います。レビューのみの依頼ではソースを編集せず、改善を依頼した場合は変更後の再解析と必要なテストまで行います。
+
+他のエージェントでは、`skills/hime-review`をそのエージェントのスキル配置先へコピーし、hime CLIを実行できるようにしてください。配置場所と呼び出し方は各エージェントの仕様に従います。
+
 ## 開発と検証
 
 ```bash
@@ -166,3 +207,7 @@ cargo clippy --locked --all-targets -- -D warnings
 | [tests/analysis.rs](tests/analysis.rs) | 解析と状態伝播のテスト |
 | [tests/cli.rs](tests/cli.rs) | JSON出力と終了コードのテスト |
 | [fixtures/effects.rs](fixtures/effects.rs) | 動作確認用のサンプル |
+
+## ライセンス
+
+MIT License。詳細は[LICENSE](LICENSE)を参照してください。
