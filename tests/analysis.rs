@@ -238,3 +238,112 @@ fn trait_impl_methods_are_named_by_type() {
     .collect();
     assert_eq!(names, ["T::m", "<S as T>::m"]);
 }
+fn named(source: &str) -> Vec<(String, Status)> {
+    analyze_source("test.rs", source)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.function, r.status))
+        .collect()
+}
+#[test]
+fn block_local_functions_do_not_leak_out_of_their_block() {
+    let reports = named(
+        "fn helper() { println!(\"e\"); } pub fn run() { { fn helper() {} helper(); } helper(); }",
+    );
+    assert_eq!(
+        reports,
+        [
+            ("helper".into(), Status::Impure),
+            ("run".into(), Status::Impure),
+            ("run::helper".into(), Status::Candidate),
+        ]
+    );
+}
+#[test]
+fn block_local_functions_shadow_inside_their_block() {
+    assert_eq!(
+        statuses("fn helper() { println!(\"e\"); } pub fn run() { { fn helper() {} helper(); } }"),
+        [Status::Impure, Status::Candidate, Status::Candidate]
+    );
+}
+#[test]
+fn constructors_in_other_modules_do_not_hide_functions() {
+    assert_eq!(
+        statuses(
+            "mod values { pub struct helper(pub i32); } fn helper(_: i32) { println!(\"e\"); } pub fn run() { helper(1); }"
+        ),
+        [Status::Impure, Status::Impure]
+    );
+}
+#[test]
+fn constructors_resolve_by_scope() {
+    assert_eq!(
+        statuses(
+            "struct W(i32); enum E { V(i32) } mod m { pub struct P(pub i32); } fn run() { W(1); E::V(1); m::P(1); Some(1); Ok::<i32, ()>(1); }"
+        ),
+        [Status::Candidate]
+    );
+}
+#[test]
+fn local_functions_shadow_prelude_constructors() {
+    assert_eq!(
+        statuses("fn Some(x: i32) -> i32 { println!(\"e\"); x } fn run() { Some(1); }"),
+        [Status::Impure, Status::Impure]
+    );
+}
+#[test]
+fn let_initializer_is_resolved_before_its_binding() {
+    assert_eq!(
+        statuses("fn helper() { println!(\"e\"); } pub fn run() { let helper = helper(); }"),
+        [Status::Impure, Status::Impure]
+    );
+}
+#[test]
+fn bindings_end_with_their_block() {
+    assert_eq!(
+        statuses(
+            "fn helper() { println!(\"e\"); } pub fn run() { { let helper: fn() = || {}; helper(); } helper(); }"
+        ),
+        [Status::Impure, Status::Impure]
+    );
+}
+#[test]
+fn bindings_shadow_calls_inside_their_block() {
+    let reports = analyze_source(
+        "test.rs",
+        "fn helper() {} pub fn run(helper: fn()) { helper(); }",
+    )
+    .unwrap();
+    assert!(
+        reports[1]
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "indirect_call")
+    );
+}
+#[test]
+fn file_attributes_apply_to_functions() {
+    assert_eq!(
+        statuses("#![cfg(any())]\npub fn run() {}"),
+        [Status::Unknown]
+    );
+    assert_eq!(
+        statuses("#![allow(dead_code)]\n//! doc\npub fn run() {}"),
+        [Status::Candidate]
+    );
+}
+#[test]
+fn static_function_pointer_calls_access_static_state() {
+    let reports = analyze_source(
+        "test.rs",
+        "static CALLBACK: fn() = effect; fn effect() { println!(\"e\"); } pub fn run() { CALLBACK(); }",
+    )
+    .unwrap();
+    assert_eq!(reports[1].status, Status::Impure);
+    assert!(
+        reports[1]
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "static_state")
+    );
+}
