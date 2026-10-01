@@ -28,3 +28,19 @@ fn strict_unknown_and_input_errors() {
     fs::remove_file(path).unwrap();
     assert_eq!(cli().arg("--invalid").status().unwrap().code(), Some(2));
 }
+#[test]
+fn duplicate_paths_and_skipped_inputs() {
+    let output = cli()
+        .args(["fixtures", "./fixtures/effects.rs"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("7 functions"), "{text}");
+    let output = cli().arg("Cargo.toml").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("skipping non-Rust file Cargo.toml")
+    );
+}
