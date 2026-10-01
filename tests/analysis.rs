@@ -347,3 +347,211 @@ fn static_function_pointer_calls_access_static_state() {
             .any(|d| d.code == "static_state")
     );
 }
+
+// Issues #11–#15: regressions introduced by scope-aware collection.
+#[test]
+fn conditional_bindings_end_before_else_and_after_if_or_while() {
+    let source = r#"
+        fn helper() { println!("effect"); }
+        fn after_if(o: Option<fn()>) {
+            if let Some(helper) = o { helper(); }
+            helper();
+        }
+        fn in_else(o: Option<fn()>) {
+            if let Some(helper) = o { helper(); } else { helper(); }
+        }
+        fn after_while(o: Option<fn()>) {
+            while let Some(helper) = o { helper(); break; }
+            helper();
+        }
+        fn chain(o: Option<fn()>) {
+            if let Some(helper) = o && let () = helper() { helper(); }
+            helper();
+        }
+    "#;
+    assert_eq!(statuses(source), [Status::Impure; 5]);
+    for name in ["after_if", "in_else", "after_while", "chain"] {
+        assert!(
+            report(source, name)
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "indirect_call")
+        );
+    }
+}
+
+#[test]
+fn local_imports_resolve_constructors_functions_and_module_aliases() {
+    let source = r#"
+        mod m {
+            pub struct W(pub i32);
+            pub enum E { V(i32) }
+            pub fn effect() { println!("effect"); }
+        }
+        use m::{self as alias, W, E::V, effect as g};
+        fn constructors() { W(1); V(2); alias::W(3); }
+        fn caller() { g(); }
+    "#;
+    assert_eq!(status_of(source, "constructors"), Status::Candidate);
+    assert_eq!(status_of(source, "caller"), Status::Impure);
+}
+
+#[test]
+fn glob_imports_resolve_variants_and_reexports() {
+    let source = r#"
+        mod m {
+            pub struct W(pub i32);
+            pub enum E { V(i32) }
+            pub fn effect() { println!("effect"); }
+        }
+        mod exports { pub use crate::m::*; }
+        use exports::*;
+        use m::E::*;
+        fn constructors() { W(1); V(2); }
+        fn caller() { effect(); }
+    "#;
+    assert_eq!(status_of(source, "constructors"), Status::Candidate);
+    assert_eq!(status_of(source, "caller"), Status::Impure);
+}
+
+#[test]
+fn imports_obey_blocks_and_relative_paths() {
+    let source = r#"
+        mod m { pub fn helper() { println!("effect"); } pub struct W(pub i32); }
+        mod n {
+            use super::m::W as P;
+            fn constructor() { P(1); }
+            fn effect() { use super::m::helper; helper(); }
+        }
+        fn helper() {}
+        fn scoped() { { use m::helper; helper(); } }
+        fn outside() { { use m::helper; } helper(); }
+    "#;
+    assert_eq!(status_of(source, "n::constructor"), Status::Candidate);
+    assert_eq!(status_of(source, "n::effect"), Status::Impure);
+    assert_eq!(status_of(source, "scoped"), Status::Impure);
+    assert_eq!(status_of(source, "outside"), Status::Candidate);
+}
+
+#[test]
+fn unresolved_and_ambiguous_imports_do_not_fall_back_to_pure_targets() {
+    for source in [
+        "use external::Some; fn f() { Some(1); }",
+        "use external::*; fn f() { Some(1); }",
+        "mod a { pub struct W(pub i32); } mod b { pub struct W(pub i32); } use a::*; use b::*; fn f() { W(1); }",
+        "use a as b; use b as a; fn f() { a(); }",
+        "fn helper() {} fn f() { use external::helper; helper(); }",
+        "mod m; use m::W; fn f() { W(1); }",
+    ] {
+        assert_eq!(status_of(source, "f"), Status::Unknown, "{source}");
+    }
+}
+
+#[test]
+fn explicit_items_shadow_globs_and_aliases_can_chain() {
+    let source = r#"
+        mod m { pub fn helper() { println!("effect"); } pub struct W(pub i32); }
+        use m::*;
+        use m::W as A;
+        use A as B;
+        fn helper() {}
+        fn f() { helper(); B(1); }
+    "#;
+    assert_eq!(status_of(source, "f"), Status::Candidate);
+}
+
+#[test]
+fn imports_keep_type_and_value_namespaces_separate() {
+    let source = r#"
+        mod m {
+            pub enum E { V(i32) }
+            pub fn E() { println!("effect"); }
+            pub struct T { pub x: i32 }
+            pub fn T() {}
+        }
+        use m::{E, T};
+        fn value() { E(); }
+        fn constructor() { E::V(1); T(); }
+        fn local() { mod E {} E(); }
+    "#;
+    assert_eq!(status_of(source, "value"), Status::Impure);
+    assert_eq!(status_of(source, "constructor"), Status::Candidate);
+    assert_eq!(status_of(source, "local"), Status::Impure);
+}
+
+#[test]
+fn repeated_glob_reexports_of_the_same_item_are_not_ambiguous() {
+    let source = r#"
+        mod m { pub struct W(pub i32); }
+        mod a { pub use crate::m::*; }
+        mod b { pub use crate::m::*; }
+        use a::*; use b::*;
+        fn f() { W(1); }
+    "#;
+    assert_eq!(status_of(source, "f"), Status::Candidate);
+}
+
+#[test]
+fn functions_inside_discriminants_and_field_types_are_collected() {
+    assert_eq!(
+        named(
+            "pub enum E { A = { const fn n() -> isize { assert!(1 > 0); 1 } n() } } pub struct S([u8; { const fn m() -> usize { assert!(1 > 0); 3 } m() }]);"
+        ),
+        [("n".into(), Status::Impure), ("m".into(), Status::Impure)]
+    );
+}
+
+#[test]
+fn benign_crate_attributes_do_not_change_function_status() {
+    for attrs in [
+        "#![no_std] #![recursion_limit = \"256\"] #![cfg_attr(docsrs, feature(doc_cfg))]",
+        "#![no_implicit_prelude] #![type_length_limit = \"100000\"] #![crate_name = \"test\"] #![crate_type = \"lib\"] #![windows_subsystem = \"windows\"]",
+        "#![cfg_attr(not(feature = \"std\"), no_std)]",
+        "#![cfg_attr(docsrs, cfg_attr(nightly, feature(doc_cfg)), allow(dead_code))]",
+    ] {
+        assert_eq!(
+            statuses(&format!(
+                "{attrs} fn add(a: i32, b: i32) -> i32 {{ a + b }}"
+            )),
+            [Status::Candidate],
+            "{attrs}"
+        );
+    }
+    for attrs in [
+        "#![cfg(any())]",
+        "#![cfg_attr(feature = \"x\", cfg(any()))]",
+        "#![feature(specialization)]",
+        "#![cfg_attr(docsrs, feature(doc_cfg, specialization))]",
+        "#![custom]",
+    ] {
+        assert_eq!(
+            statuses(&format!("{attrs} fn f() {{}}")),
+            [Status::Unknown],
+            "{attrs}"
+        );
+    }
+}
+
+#[test]
+fn cfg_alternative_constructors_are_candidates_but_functions_stay_ambiguous() {
+    assert_eq!(
+        statuses(
+            "#[cfg(unix)] struct W(i32); #[cfg(not(unix))] struct W(i64); #[cfg(unix)] enum H { Fd(i32) } #[cfg(not(unix))] enum H { Fd(i64) } fn run() { W(1); H::Fd(1); }"
+        ),
+        [Status::Candidate]
+    );
+    assert_eq!(
+        status_of(
+            "#[cfg(unix)] fn target() {} #[cfg(not(unix))] fn target() {} fn run() { target(); }",
+            "run"
+        ),
+        Status::Unknown
+    );
+    assert_eq!(
+        status_of(
+            "#[cfg(unix)] struct W(i32); #[cfg(not(unix))] fn W(_: i32) {} fn run() { W(1); }",
+            "run"
+        ),
+        Status::Unknown
+    );
+}

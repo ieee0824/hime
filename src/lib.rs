@@ -82,7 +82,53 @@ fn path_name(path: &Path) -> String {
 
 /// Attributes that cannot change what a function body executes.
 fn is_benign(attr: &Attribute) -> bool {
-    let name = path_name(attr.path());
+    benign_meta(&attr.meta, false)
+}
+
+fn benign_meta(meta: &Meta, crate_level: bool) -> bool {
+    let name = path_name(meta.path());
+    if name == "cfg_attr" {
+        // Its predicate selects attributes, not code. Inspect every possible attribute.
+        return match meta {
+            Meta::List(list) => list
+                .parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)
+                .is_ok_and(|args| {
+                    args.len() >= 2 && args.iter().skip(1).all(|m| benign_meta(m, crate_level))
+                }),
+            _ => false,
+        };
+    }
+    if crate_level {
+        if [
+            "no_std",
+            "no_implicit_prelude",
+            "recursion_limit",
+            "type_length_limit",
+            "crate_name",
+            "crate_type",
+            "windows_subsystem",
+        ]
+        .contains(&name.as_str())
+        {
+            return true;
+        }
+        if name == "feature" {
+            // Documentation features are harmless; arbitrary language features are not.
+            return match meta {
+                Meta::List(list) => list
+                    .parse_args_with(
+                        syn::punctuated::Punctuated::<Path, Token![,]>::parse_terminated,
+                    )
+                    .is_ok_and(|features| {
+                        !features.is_empty()
+                            && features.iter().all(|p| {
+                                ["doc_cfg", "doc_auto_cfg"].contains(&path_name(p).as_str())
+                            })
+                    }),
+                _ => false,
+            };
+        }
+    }
     [
         "doc",
         "inline",
@@ -124,11 +170,252 @@ impl<'ast> Visit<'ast> for FileItems {
 }
 
 /// What a resolved call path refers to.
-#[derive(Clone, Copy)]
+#[derive(Clone, PartialEq, Eq)]
 enum Target {
     Function(usize),
     /// Tuple struct and variant constructors only build a value.
     Constructor,
+    Namespace(Vec<String>),
+    Type,
+    Value,
+    Import(usize),
+    Unknown,
+}
+
+impl Target {
+    fn in_namespace(&self, namespace: bool) -> bool {
+        match self {
+            Self::Namespace(_) | Self::Type => namespace,
+            Self::Function(_) | Self::Constructor | Self::Value => !namespace,
+            Self::Import(_) | Self::Unknown => true,
+        }
+    }
+}
+
+type LookupStack = BTreeSet<(Vec<String>, bool)>;
+
+#[derive(Clone)]
+struct Import {
+    scope: Vec<String>,
+    path: Vec<String>,
+    absolute: bool,
+}
+
+#[derive(Default)]
+struct Definitions {
+    names: BTreeMap<Vec<String>, Vec<Target>>,
+    imports: Vec<Import>,
+    globs: BTreeMap<Vec<String>, Vec<usize>>,
+}
+
+struct Resolution {
+    key: Vec<String>,
+    targets: Vec<Target>,
+}
+
+impl Resolution {
+    fn unknown(key: Vec<String>) -> Self {
+        Self {
+            key,
+            targets: vec![Target::Unknown],
+        }
+    }
+}
+
+impl Definitions {
+    /// Resolve imports lazily, with cycle detection for aliases and glob reexports.
+    fn resolve(
+        &self,
+        path: &[String],
+        scope: &[String],
+        absolute: bool,
+        namespace: bool,
+        visiting: &mut LookupStack,
+    ) -> Option<Resolution> {
+        let first = path.first()?;
+        if absolute {
+            // In edition 2024, leading `::` addresses the external-crate prelude.
+            return Some(Resolution::unknown(path.to_vec()));
+        }
+        let (prefix, rest) = match first.as_str() {
+            "crate" => (vec![], &path[1..]),
+            "self" => (module_of(scope), &path[1..]),
+            "super" => {
+                let mut module = module_of(scope);
+                let mut rest = path;
+                while rest.first().is_some_and(|p| p == "super") {
+                    if module.is_empty() {
+                        return Some(Resolution::unknown(path.to_vec()));
+                    }
+                    module.pop();
+                    module = module_of(&module);
+                    rest = &rest[1..];
+                }
+                (module, rest)
+            }
+            _ => {
+                for end in (module_of(scope).len()..=scope.len()).rev() {
+                    if let Some(found) =
+                        self.lookup(&scope[..end], first, path.len() > 1 || namespace, visiting)
+                    {
+                        return Some(self.descend(found, &path[1..], namespace, visiting));
+                    }
+                }
+                return None;
+            }
+        };
+        let found = Resolution {
+            key: prefix.clone(),
+            targets: vec![Target::Namespace(prefix)],
+        };
+        Some(self.descend(found, rest, namespace, visiting))
+    }
+
+    fn descend(
+        &self,
+        mut found: Resolution,
+        rest: &[String],
+        namespace: bool,
+        visiting: &mut LookupStack,
+    ) -> Resolution {
+        for (index, name) in rest.iter().enumerate() {
+            let prefix = match found.targets.as_slice() {
+                [Target::Namespace(prefix)] => prefix,
+                _ => return Resolution::unknown(found.key),
+            };
+            found = match self.lookup(prefix, name, index + 1 < rest.len() || namespace, visiting) {
+                Some(next) => next,
+                None => return Resolution::unknown(found.key),
+            };
+        }
+        found
+    }
+
+    fn import(
+        &self,
+        index: usize,
+        namespace: bool,
+        visiting: &mut LookupStack,
+    ) -> Option<Resolution> {
+        let import = &self.imports[index];
+        if let Some(mut resolved) = self.resolve(
+            &import.path,
+            &import.scope,
+            import.absolute,
+            namespace,
+            visiting,
+        ) {
+            resolved
+                .targets
+                .retain(|target| target.in_namespace(namespace));
+            return (!resolved.targets.is_empty()).then_some(resolved);
+        }
+        // A known type-only import does not shadow the value namespace (and vice versa).
+        let other = self.resolve(
+            &import.path,
+            &import.scope,
+            import.absolute,
+            !namespace,
+            visiting,
+        );
+        if other.is_some_and(|r| !r.targets.contains(&Target::Unknown)) {
+            return None;
+        }
+        Some(Resolution::unknown(import.path.clone()))
+    }
+
+    fn lookup(
+        &self,
+        scope: &[String],
+        name: &str,
+        namespace: bool,
+        visiting: &mut LookupStack,
+    ) -> Option<Resolution> {
+        let mut key = scope.to_vec();
+        key.push(name.into());
+        let request = (key.clone(), namespace);
+        if !visiting.insert(request.clone()) {
+            return Some(Resolution::unknown(key));
+        }
+        let result = self.lookup_inner(scope, name, &key, namespace, visiting);
+        visiting.remove(&request);
+        result
+    }
+
+    fn lookup_inner(
+        &self,
+        scope: &[String],
+        name: &str,
+        key: &[String],
+        namespace: bool,
+        visiting: &mut LookupStack,
+    ) -> Option<Resolution> {
+        let mut found = vec![];
+        let targets = self
+            .names
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|target| target.in_namespace(namespace))
+            .collect::<Vec<_>>();
+        if !targets.is_empty() {
+            // Explicit definitions and imports take priority over globs.
+            for target in targets {
+                match target {
+                    Target::Import(index) => {
+                        if let Some(imported) = self.import(*index, namespace, visiting) {
+                            found.push(imported);
+                        }
+                    }
+                    target => found.push(Resolution {
+                        key: key.to_vec(),
+                        targets: vec![target.clone()],
+                    }),
+                }
+            }
+        }
+        if found.is_empty()
+            && let Some(globs) = self.globs.get(scope)
+        {
+            for index in globs {
+                let Some(imported) = self.import(*index, true, visiting) else {
+                    return Some(Resolution::unknown(key.to_vec()));
+                };
+                match imported.targets.as_slice() {
+                    [Target::Namespace(prefix)] => {
+                        if let Some(next) = self.lookup(prefix, name, namespace, visiting) {
+                            found.push(next);
+                        }
+                    }
+                    // An unresolved glob can contain this name, so cannot be ignored.
+                    _ => return Some(Resolution::unknown(key.to_vec())),
+                }
+            }
+        }
+        let mut iter = found.into_iter();
+        let mut result = iter.next()?;
+        for next in iter {
+            if result.key != next.key {
+                return Some(Resolution::unknown(key.to_vec()));
+            }
+            result.targets.extend(next.targets);
+        }
+        result
+            .targets
+            .retain(|target| target.in_namespace(namespace));
+        if result.targets.is_empty() {
+            return None;
+        }
+        // Reimports of the same item and cfg alternatives of a constructor agree.
+        let mut unique = vec![];
+        for target in result.targets {
+            if !unique.contains(&target) {
+                unique.push(target);
+            }
+        }
+        result.targets = unique;
+        Some(result)
+    }
 }
 
 struct Collector<'a> {
@@ -138,10 +425,66 @@ struct Collector<'a> {
     /// Human-readable prefix for report names.
     display: Vec<String>,
     reports: Vec<FunctionReport>,
-    constructors: Vec<Vec<String>>,
+    definitions: Definitions,
     items: &'a FileItems,
 }
 impl Collector<'_> {
+    fn define(&mut self, name: String, target: Target) {
+        let mut key = self.path.clone();
+        key.push(name);
+        self.definitions.names.entry(key).or_default().push(target);
+    }
+    fn collect_use(&mut self, tree: &UseTree, prefix: &[String], absolute: bool) {
+        let (name, path) = match tree {
+            UseTree::Path(p) => {
+                let mut path = prefix.to_vec();
+                path.push(p.ident.to_string());
+                self.collect_use(&p.tree, &path, absolute);
+                return;
+            }
+            UseTree::Group(group) => {
+                for tree in &group.items {
+                    self.collect_use(tree, prefix, absolute);
+                }
+                return;
+            }
+            UseTree::Name(n) => {
+                if n.ident == "self" {
+                    (prefix.last().cloned(), prefix.to_vec())
+                } else {
+                    let mut path = prefix.to_vec();
+                    path.push(n.ident.to_string());
+                    (Some(n.ident.to_string()), path)
+                }
+            }
+            UseTree::Rename(n) => {
+                if n.rename == "_" {
+                    return;
+                }
+                let mut path = prefix.to_vec();
+                if n.ident != "self" {
+                    path.push(n.ident.to_string());
+                }
+                (Some(n.rename.to_string()), path)
+            }
+            UseTree::Glob(_) => (None, prefix.to_vec()),
+        };
+        let index = self.definitions.imports.len();
+        self.definitions.imports.push(Import {
+            scope: self.path.clone(),
+            path,
+            absolute,
+        });
+        if let Some(name) = name {
+            self.define(name, Target::Import(index));
+        } else {
+            self.definitions
+                .globs
+                .entry(self.path.clone())
+                .or_default()
+                .push(index);
+        }
+    }
     fn analyze(
         &mut self,
         sig: &Signature,
@@ -270,12 +613,16 @@ impl Collector<'_> {
 impl<'ast> Visit<'ast> for Collector<'_> {
     fn visit_file(&mut self, file: &'ast File) {
         visit::visit_file(self, file);
-        let span = file
-            .attrs
-            .iter()
-            .find(|a| !is_benign(a))
-            .map_or_else(Span::call_site, |a| a.span());
-        self.mark_enclosed(0, &file.attrs, span, "file_attribute");
+        if let Some(attr) = file.attrs.iter().find(|a| !benign_meta(&a.meta, true)) {
+            for report in &mut self.reports {
+                report.add(
+                    attr.span(),
+                    Status::Unknown,
+                    "file_attribute",
+                    "enclosing item attributes are not expanded",
+                );
+            }
+        }
     }
     fn visit_block(&mut self, block: &'ast Block) {
         self.path.push(block_id(block));
@@ -283,27 +630,56 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         self.path.pop();
     }
     fn visit_item_struct(&mut self, item: &'ast ItemStruct) {
+        self.define(item.ident.to_string(), Target::Type);
         if matches!(item.fields, Fields::Unnamed(_)) {
-            self.constructors.push(
-                self.path
-                    .iter()
-                    .cloned()
-                    .chain([item.ident.to_string()])
-                    .collect(),
-            );
+            self.define(item.ident.to_string(), Target::Constructor);
         }
+        visit::visit_item_struct(self, item);
     }
     fn visit_item_enum(&mut self, item: &'ast ItemEnum) {
+        let mut namespace = self.path.clone();
+        namespace.push(item.ident.to_string());
+        self.define(item.ident.to_string(), Target::Namespace(namespace.clone()));
         for variant in &item.variants {
-            if matches!(variant.fields, Fields::Unnamed(_)) {
-                let names = [item.ident.to_string(), variant.ident.to_string()];
-                self.constructors
-                    .push(self.path.iter().cloned().chain(names).collect());
-            }
+            let mut key = namespace.clone();
+            key.push(variant.ident.to_string());
+            self.definitions.names.entry(key).or_default().push(
+                if matches!(variant.fields, Fields::Unnamed(_)) {
+                    Target::Constructor
+                } else {
+                    Target::Unknown
+                },
+            );
         }
+        visit::visit_item_enum(self, item);
+    }
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        self.collect_use(&item.tree, &[], item.leading_colon.is_some());
+    }
+    fn visit_item_const(&mut self, item: &'ast ItemConst) {
+        self.define(item.ident.to_string(), Target::Value);
+        visit::visit_item_const(self, item);
+    }
+    fn visit_item_static(&mut self, item: &'ast ItemStatic) {
+        self.define(item.ident.to_string(), Target::Value);
+        visit::visit_item_static(self, item);
+    }
+    fn visit_item_type(&mut self, item: &'ast ItemType) {
+        self.define(item.ident.to_string(), Target::Type);
+        visit::visit_item_type(self, item);
     }
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
         let start = self.reports.len();
+        let mut namespace = self.path.clone();
+        namespace.push(item.ident.to_string());
+        self.define(
+            item.ident.to_string(),
+            if item.content.is_some() {
+                Target::Namespace(namespace)
+            } else {
+                Target::Unknown
+            },
+        );
         self.path.push(item.ident.to_string());
         self.display.push(item.ident.to_string());
         visit::visit_item_mod(self, item);
@@ -343,6 +719,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     }
     fn visit_item_trait(&mut self, item: &'ast ItemTrait) {
         let start = self.reports.len();
+        self.define(item.ident.to_string(), Target::Type);
         self.display.push(item.ident.to_string());
         visit::visit_item_trait(self, item);
         self.display.pop();
@@ -423,6 +800,27 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         }
         self.visit_expr(&node.expr);
         self.visit_pat(&node.pat);
+    }
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        self.with_frame(|s| {
+            s.visit_expr(&node.cond);
+            s.visit_block(&node.then_branch);
+        });
+        if let Some((_, branch)) = &node.else_branch {
+            self.visit_expr(branch);
+        }
+    }
+    fn visit_expr_while(&mut self, node: &'ast ExprWhile) {
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        self.with_frame(|s| {
+            s.visit_expr(&node.cond);
+            s.visit_block(&node.body);
+        });
     }
     fn visit_arm(&mut self, node: &'ast Arm) {
         self.with_frame(|s| visit::visit_arm(s, node));
@@ -690,36 +1088,34 @@ pub fn analyze_source(file: &str, source: &str) -> syn::Result<Vec<FunctionRepor
         path: vec![],
         display: vec![],
         reports: vec![],
-        constructors: vec![],
+        definitions: Definitions::default(),
         items: &items,
     };
     collector.visit_file(&ast);
     let mut reports = collector.reports;
-    let mut names: BTreeMap<Vec<String>, Vec<Target>> = BTreeMap::new();
+    let mut definitions = collector.definitions;
     for (i, report) in reports.iter().enumerate() {
         if let Some(key) = &report.key {
-            names
+            definitions
+                .names
                 .entry(key.clone())
                 .or_default()
                 .push(Target::Function(i));
         }
-    }
-    for key in collector.constructors {
-        names.entry(key).or_default().push(Target::Constructor);
     }
     // Prelude constructors apply only when nothing in the file shadows them.
     let prelude = [Target::Constructor];
     let mut edges = vec![vec![]; reports.len()];
     for (i, report) in reports.iter_mut().enumerate() {
         for call in std::mem::take(&mut report.calls) {
-            let target = resolve_call(&call.name, &call.scope)
-                .into_iter()
-                .find_map(|candidate| names.get(&candidate).map(Vec::as_slice))
-                .or_else(|| {
-                    ["Some", "Ok", "Err"]
-                        .contains(&call.name.as_str())
-                        .then_some(&prelude[..])
-                });
+            let path = call.name.split("::").map(str::to_owned).collect::<Vec<_>>();
+            let resolved =
+                definitions.resolve(&path, &call.scope, false, false, &mut BTreeSet::new());
+            let target = resolved.as_ref().map(|r| r.targets.as_slice()).or_else(|| {
+                ["Some", "Ok", "Err"]
+                    .contains(&call.name.as_str())
+                    .then_some(&prelude[..])
+            });
             match target {
                 Some([Target::Function(index)]) => edges[i].push((*index, call.span)),
                 Some([Target::Constructor]) => {}
@@ -790,39 +1186,4 @@ fn module_of(scope: &[String]) -> Vec<String> {
         .rposition(|s| !s.starts_with('#'))
         .map_or(0, |i| i + 1);
     scope[..end].to_vec()
-}
-
-/// Candidate definitions for a call, in lookup priority order.
-fn resolve_call(call: &str, scope: &[String]) -> Vec<Vec<String>> {
-    let parts: Vec<String> = call.split("::").map(str::to_owned).collect();
-    let join =
-        |prefix: &[String], rest: &[String]| prefix.iter().chain(rest).cloned().collect::<Vec<_>>();
-    match parts[0].as_str() {
-        "crate" => vec![parts[1..].to_vec()],
-        "self" => vec![join(&module_of(scope), &parts[1..])],
-        "super" => {
-            let mut module = module_of(scope);
-            let mut rest = &parts[..];
-            while rest.first().is_some_and(|p| p == "super") {
-                // `super` above the file root points into another file.
-                if module.is_empty() {
-                    return vec![];
-                }
-                module.pop();
-                module = module_of(&module);
-                rest = &rest[1..];
-            }
-            vec![join(&module, rest)]
-        }
-        _ => {
-            // Items in enclosing blocks shadow module items.
-            let module = module_of(scope);
-            let mut candidates: Vec<_> = (module.len() + 1..=scope.len())
-                .rev()
-                .map(|end| join(&scope[..end], &parts))
-                .collect();
-            candidates.push(join(&module, &parts));
-            candidates
-        }
-    }
 }

@@ -44,3 +44,47 @@ fn duplicate_paths_and_skipped_inputs() {
             .contains("skipping non-Rust file Cargo.toml")
     );
 }
+
+#[test]
+fn issue_regressions_have_correct_strict_exit_codes() {
+    let path = std::env::temp_dir().join(format!("hime-issue-cli-{}.rs", std::process::id()));
+    for (source, expected_code, expected_status) in [
+        (
+            "pub enum E { A = { const fn n() -> isize { assert!(1 > 0); 1 } n() } } pub struct S([u8; { const fn m() -> usize { assert!(1 > 0); 3 } m() }]);",
+            1,
+            "impure",
+        ),
+        (
+            "#![no_std] #![recursion_limit = \"256\"] #![cfg_attr(docsrs, feature(doc_cfg))] pub fn add(a: i32, b: i32) -> i32 { a + b }",
+            0,
+            "candidate",
+        ),
+        ("#![cfg(any())] fn f() {}", 1, "unknown"),
+        (
+            "mod m { pub struct W(pub i32); } use m::W; fn f() { W(1); }",
+            0,
+            "candidate",
+        ),
+        (
+            "#[cfg(unix)] struct W(i32); #[cfg(not(unix))] struct W(i64); fn f() { W(1); }",
+            0,
+            "candidate",
+        ),
+    ] {
+        fs::write(&path, source).unwrap();
+        let output = cli()
+            .args(["--strict", "--json"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected_code), "{source}");
+        let reports: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let reports = reports.as_array().unwrap();
+        assert!(!reports.is_empty(), "{source}");
+        assert!(
+            reports.iter().all(|r| r["status"] == expected_status),
+            "{source}"
+        );
+    }
+    fs::remove_file(path).unwrap();
+}

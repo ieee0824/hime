@@ -51,7 +51,7 @@ fn run() -> Result<u8, String> {
             "--strict" if !positional => strict = true,
             "--help" | "-h" if !positional => {
                 println!(
-                    "hime [--json] [--strict] [PATH ...]\n\nAnalyze Rust files or directories (default: src).\nStatuses: candidate / unknown / impure. Candidate is not a purity proof.\nExit: 0 = no detected effects; 1 = impure (or unknown with --strict); 2 = input error.\nImports, types, macros and cross-file calls are not resolved."
+                    "hime [--json] [--strict] [PATH ...]\n\nAnalyze Rust files or directories (default: src).\nStatuses: candidate / unknown / impure. Candidate is not a purity proof.\nExit: 0 = no detected effects; 1 = impure (or unknown with --strict); 2 = input error.\nExternal imports, types, macros and cross-file calls are not resolved."
                 );
                 return Ok(0);
             }
