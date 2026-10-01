@@ -33,15 +33,43 @@ pub struct FunctionReport {
     pub status: Status,
     pub diagnostics: Vec<Diagnostic>,
     #[serde(skip)]
-    calls: Vec<(String, Span)>,
-    #[serde(skip)]
-    bindings: BTreeSet<String>,
+    calls: Vec<Call>,
     /// Name used to resolve calls; only free and block-local functions can be call targets.
     #[serde(skip)]
     key: Option<Vec<String>>,
-    /// Lexical scope of the body. Segments starting with `#` are function-body blocks.
-    #[serde(skip)]
+}
+
+#[derive(Debug, Clone)]
+struct Call {
+    name: String,
+    span: Span,
+    /// Lexical scope at the call site. Segments starting with `#` are blocks.
     scope: Vec<String>,
+}
+
+impl FunctionReport {
+    fn add(&mut self, span: Span, status: Status, code: &str, message: &str) {
+        self.status = self.status.max(status);
+        self.diagnostics.push(Diagnostic {
+            line: span.start().line,
+            column: span.start().column + 1,
+            status,
+            code: code.into(),
+            message: message.into(),
+        });
+    }
+}
+
+/// Scope segment for a block, unique within the file so collector and scanner agree.
+fn block_id(block: &Block) -> String {
+    let span = block.span();
+    format!(
+        "#{}:{}-{}:{}",
+        span.start().line,
+        span.start().column,
+        span.end().line,
+        span.end().column
+    )
 }
 
 fn path_name(path: &Path) -> String {
@@ -88,35 +116,29 @@ fn type_name(ty: &Type) -> String {
 #[derive(Default)]
 struct FileItems {
     statics: BTreeSet<String>,
-    constructors: BTreeSet<String>,
 }
 impl<'ast> Visit<'ast> for FileItems {
     fn visit_item_static(&mut self, item: &'ast ItemStatic) {
         self.statics.insert(item.ident.to_string());
     }
-    fn visit_item_struct(&mut self, item: &'ast ItemStruct) {
-        if matches!(item.fields, Fields::Unnamed(_)) {
-            self.constructors.insert(item.ident.to_string());
-        }
-    }
-    fn visit_item_enum(&mut self, item: &'ast ItemEnum) {
-        for variant in &item.variants {
-            if matches!(variant.fields, Fields::Unnamed(_)) {
-                self.constructors
-                    .insert(format!("{}::{}", item.ident, variant.ident));
-            }
-        }
-    }
+}
+
+/// What a resolved call path refers to.
+#[derive(Clone, Copy)]
+enum Target {
+    Function(usize),
+    /// Tuple struct and variant constructors only build a value.
+    Constructor,
 }
 
 struct Collector<'a> {
     file: String,
-    /// Resolution path: module names plus `#n` segments for function bodies.
+    /// Resolution path: module names plus `#` segments for enclosing blocks.
     path: Vec<String>,
     /// Human-readable prefix for report names.
     display: Vec<String>,
-    next_block: usize,
     reports: Vec<FunctionReport>,
+    constructors: Vec<Vec<String>>,
     items: &'a FileItems,
 }
 impl Collector<'_> {
@@ -127,9 +149,6 @@ impl Collector<'_> {
         attrs: &[Attribute],
         key: Option<Vec<String>>,
     ) {
-        let mut scope = self.path.clone();
-        scope.push(format!("#{}", self.next_block));
-        self.next_block += 1;
         let mut report = FunctionReport {
             file: self.file.clone(),
             function: self
@@ -143,14 +162,14 @@ impl Collector<'_> {
             status: Status::Candidate,
             diagnostics: vec![],
             calls: vec![],
-            bindings: BTreeSet::new(),
             key,
-            scope: scope.clone(),
         };
         let mut scanner = Scanner {
             report: &mut report,
             items: self.items,
             in_signature: true,
+            scope: self.path.clone(),
+            bindings: vec![BTreeSet::new()],
         };
         if sig.unsafety.is_some() || sig.abi.is_some() {
             scanner.add(
@@ -229,11 +248,9 @@ impl Collector<'_> {
         self.reports.push(report);
         if let Some(block) = block {
             // Items in the body form a block scope that only this body and its items can see.
-            let saved = std::mem::replace(&mut self.path, scope);
             self.display.push(sig.ident.to_string());
             self.visit_block(block);
             self.display.pop();
-            self.path = saved;
         }
     }
     fn mark_enclosed(&mut self, start: usize, attrs: &[Attribute], span: Span, code: &str) {
@@ -241,12 +258,7 @@ impl Collector<'_> {
             return;
         }
         for report in &mut self.reports[start..] {
-            Scanner {
-                report,
-                items: self.items,
-                in_signature: false,
-            }
-            .add(
+            report.add(
                 span,
                 Status::Unknown,
                 code,
@@ -256,6 +268,40 @@ impl Collector<'_> {
     }
 }
 impl<'ast> Visit<'ast> for Collector<'_> {
+    fn visit_file(&mut self, file: &'ast File) {
+        visit::visit_file(self, file);
+        let span = file
+            .attrs
+            .iter()
+            .find(|a| !is_benign(a))
+            .map_or_else(Span::call_site, |a| a.span());
+        self.mark_enclosed(0, &file.attrs, span, "file_attribute");
+    }
+    fn visit_block(&mut self, block: &'ast Block) {
+        self.path.push(block_id(block));
+        visit::visit_block(self, block);
+        self.path.pop();
+    }
+    fn visit_item_struct(&mut self, item: &'ast ItemStruct) {
+        if matches!(item.fields, Fields::Unnamed(_)) {
+            self.constructors.push(
+                self.path
+                    .iter()
+                    .cloned()
+                    .chain([item.ident.to_string()])
+                    .collect(),
+            );
+        }
+    }
+    fn visit_item_enum(&mut self, item: &'ast ItemEnum) {
+        for variant in &item.variants {
+            if matches!(variant.fields, Fields::Unnamed(_)) {
+                let names = [item.ident.to_string(), variant.ident.to_string()];
+                self.constructors
+                    .push(self.path.iter().cloned().chain(names).collect());
+            }
+        }
+    }
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
         let start = self.reports.len();
         self.path.push(item.ident.to_string());
@@ -312,17 +358,23 @@ struct Scanner<'a> {
     report: &'a mut FunctionReport,
     items: &'a FileItems,
     in_signature: bool,
+    /// Lexical scope at the current position.
+    scope: Vec<String>,
+    /// Local bindings per lexical scope, innermost last.
+    bindings: Vec<BTreeSet<String>>,
 }
 impl Scanner<'_> {
     fn add(&mut self, span: Span, status: Status, code: &str, message: &str) {
-        self.report.status = self.report.status.max(status);
-        self.report.diagnostics.push(Diagnostic {
-            line: span.start().line,
-            column: span.start().column + 1,
-            status,
-            code: code.into(),
-            message: message.into(),
-        });
+        self.report.add(span, status, code, message);
+    }
+    fn is_bound(&self, name: &str) -> bool {
+        self.bindings.iter().any(|frame| frame.contains(name))
+    }
+    /// Run `f` with a fresh binding frame that is dropped afterwards.
+    fn with_frame(&mut self, f: impl FnOnce(&mut Self)) {
+        self.bindings.push(BTreeSet::new());
+        f(self);
+        self.bindings.pop();
     }
     /// A top-level `&mut` parameter or return type hands caller-owned state to the function.
     fn signature_type(&mut self, ty: &Type) {
@@ -342,8 +394,48 @@ impl Scanner<'_> {
 }
 impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_pat_ident(&mut self, node: &'ast PatIdent) {
-        self.report.bindings.insert(node.ident.to_string());
+        if let Some(frame) = self.bindings.last_mut() {
+            frame.insert(node.ident.to_string());
+        }
         visit::visit_pat_ident(self, node);
+    }
+    fn visit_block(&mut self, node: &'ast Block) {
+        self.scope.push(block_id(node));
+        self.with_frame(|s| visit::visit_block(s, node));
+        self.scope.pop();
+    }
+    fn visit_local(&mut self, node: &'ast Local) {
+        // The initializer runs before the new bindings come into scope.
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        if let Some(init) = &node.init {
+            self.visit_expr(&init.expr);
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+        self.visit_pat(&node.pat);
+    }
+    fn visit_expr_let(&mut self, node: &'ast ExprLet) {
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        self.visit_expr(&node.expr);
+        self.visit_pat(&node.pat);
+    }
+    fn visit_arm(&mut self, node: &'ast Arm) {
+        self.with_frame(|s| visit::visit_arm(s, node));
+    }
+    fn visit_expr_for_loop(&mut self, node: &'ast ExprForLoop) {
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        self.visit_expr(&node.expr);
+        self.with_frame(|s| {
+            s.visit_pat(&node.pat);
+            s.visit_block(&node.body);
+        });
     }
     fn visit_item(&mut self, _: &'ast Item) {} // Declarations are analyzed separately, not executed.
     fn visit_type_reference(&mut self, node: &'ast TypeReference) {
@@ -378,7 +470,8 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
         if let Expr::Path(p) = &*node.func {
             let name = path_name(&p.path);
-            if self.report.bindings.contains(&name) {
+            self.visit_expr_path(p);
+            if self.is_bound(&name) {
                 self.add(
                     node.span(),
                     Status::Unknown,
@@ -399,12 +492,12 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                     "unresolved_call",
                     "qualified trait call requires type resolution",
                 );
-            } else if ["Some", "Ok", "Err"].contains(&name.as_str())
-                || self.items.constructors.contains(&name)
-            {
-                // Tuple struct and variant constructors only build a value.
             } else {
-                self.report.calls.push((name, node.span()));
+                self.report.calls.push(Call {
+                    name,
+                    span: node.span(),
+                    scope: self.scope.clone(),
+                });
             }
         } else {
             self.add(
@@ -467,11 +560,13 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         );
     }
     fn visit_expr_path(&mut self, node: &'ast ExprPath) {
-        if node
-            .path
-            .segments
-            .iter()
-            .any(|s| self.items.statics.contains(&s.ident.to_string()))
+        let local = node.path.segments.len() == 1 && self.is_bound(&path_name(&node.path));
+        if !local
+            && node
+                .path
+                .segments
+                .iter()
+                .any(|s| self.items.statics.contains(&s.ident.to_string()))
         {
             self.add(
                 node.span(),
@@ -508,7 +603,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             "closure",
             "closure execution and captured effects require dataflow analysis",
         );
-        visit::visit_expr_closure(self, node);
+        self.with_frame(|s| visit::visit_expr_closure(s, node));
     }
     fn visit_expr_async(&mut self, node: &'ast ExprAsync) {
         self.add(
@@ -594,39 +689,46 @@ pub fn analyze_source(file: &str, source: &str) -> syn::Result<Vec<FunctionRepor
         file: file.into(),
         path: vec![],
         display: vec![],
-        next_block: 0,
         reports: vec![],
+        constructors: vec![],
         items: &items,
     };
     collector.visit_file(&ast);
     let mut reports = collector.reports;
-    let mut names: BTreeMap<Vec<String>, Vec<usize>> = BTreeMap::new();
+    let mut names: BTreeMap<Vec<String>, Vec<Target>> = BTreeMap::new();
     for (i, report) in reports.iter().enumerate() {
         if let Some(key) = &report.key {
-            names.entry(key.clone()).or_default().push(i);
+            names
+                .entry(key.clone())
+                .or_default()
+                .push(Target::Function(i));
         }
     }
+    for key in collector.constructors {
+        names.entry(key).or_default().push(Target::Constructor);
+    }
+    // Prelude constructors apply only when nothing in the file shadows them.
+    let prelude = [Target::Constructor];
     let mut edges = vec![vec![]; reports.len()];
     for (i, report) in reports.iter_mut().enumerate() {
-        for (call, span) in report.calls.clone() {
-            let target = resolve_call(&call, &report.scope)
+        for call in std::mem::take(&mut report.calls) {
+            let target = resolve_call(&call.name, &call.scope)
                 .into_iter()
-                .find_map(|candidate| names.get(&candidate));
-            match target.filter(|v| v.len() == 1) {
-                Some(indices) => edges[i].push((indices[0], span)),
-                None => {
-                    Scanner {
-                        report,
-                        items: &items,
-                        in_signature: false,
-                    }
-                    .add(
-                        span,
-                        Status::Unknown,
-                        "unresolved_call",
-                        &format!("call {call} cannot be resolved in this file"),
-                    );
-                }
+                .find_map(|candidate| names.get(&candidate).map(Vec::as_slice))
+                .or_else(|| {
+                    ["Some", "Ok", "Err"]
+                        .contains(&call.name.as_str())
+                        .then_some(&prelude[..])
+                });
+            match target {
+                Some([Target::Function(index)]) => edges[i].push((*index, call.span)),
+                Some([Target::Constructor]) => {}
+                _ => report.add(
+                    call.span,
+                    Status::Unknown,
+                    "unresolved_call",
+                    &format!("call {} cannot be resolved in this file", call.name),
+                ),
             }
         }
     }
@@ -646,12 +748,7 @@ pub fn analyze_source(file: &str, source: &str) -> syn::Result<Vec<FunctionRepor
     };
     for (start, calls) in edges.iter().enumerate() {
         if let Some((_, span)) = calls.iter().find(|(target, _)| reaches(*target, start)) {
-            Scanner {
-                report: &mut reports[start],
-                items: &items,
-                in_signature: false,
-            }
-            .add(
+            reports[start].add(
                 *span,
                 Status::Unknown,
                 "recursion",
@@ -678,12 +775,7 @@ pub fn analyze_source(file: &str, source: &str) -> syn::Result<Vec<FunctionRepor
                     "call to {} propagates {status:?}",
                     reports[*target].function
                 );
-                Scanner {
-                    report: &mut reports[i],
-                    items: &items,
-                    in_signature: false,
-                }
-                .add(*span, status, "callee_effect", &message);
+                reports[i].add(*span, status, "callee_effect", &message);
             }
         }
         reports[i].diagnostics.sort_by_key(|d| (d.line, d.column));
@@ -691,7 +783,7 @@ pub fn analyze_source(file: &str, source: &str) -> syn::Result<Vec<FunctionRepor
     Ok(reports)
 }
 
-/// Drop trailing function-body segments to get the enclosing module.
+/// Drop trailing block segments to get the enclosing module.
 fn module_of(scope: &[String]) -> Vec<String> {
     let end = scope
         .iter()
@@ -723,7 +815,7 @@ fn resolve_call(call: &str, scope: &[String]) -> Vec<Vec<String>> {
             vec![join(&module, rest)]
         }
         _ => {
-            // Items in enclosing function bodies shadow module items.
+            // Items in enclosing blocks shadow module items.
             let module = module_of(scope);
             let mut candidates: Vec<_> = (module.len() + 1..=scope.len())
                 .rev()
