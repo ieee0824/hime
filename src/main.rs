@@ -1,22 +1,27 @@
 use hime::{Status, analyze_source};
 use std::{
+    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
-fn files(path: &Path, result: &mut Vec<PathBuf>) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+fn files(path: &Path, result: &mut Vec<PathBuf>, explicit: bool) -> Result<(), String> {
+    let error = |e: std::io::Error| format!("{}: {e}", path.display());
+    let metadata = fs::symlink_metadata(path).map_err(error)?;
     // Do not follow symlinks, which could cycle or escape the requested tree.
     if metadata.file_type().is_symlink() {
+        if explicit {
+            eprintln!("hime: warning: skipping symbolic link {}", path.display());
+        }
         return Ok(());
     }
     if metadata.is_dir() {
         let mut entries = fs::read_dir(path)
-            .map_err(|e| e.to_string())?
+            .map_err(error)?
             .map(|e| e.map(|e| e.path()))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+            .map_err(error)?;
         entries.sort();
         for entry in entries {
             if entry
@@ -25,10 +30,12 @@ fn files(path: &Path, result: &mut Vec<PathBuf>) -> Result<(), String> {
             {
                 continue;
             }
-            files(&entry, result)?;
+            files(&entry, result, false)?;
         }
     } else if path.extension().is_some_and(|e| e == "rs") {
         result.push(path.to_owned());
+    } else if explicit {
+        eprintln!("hime: warning: skipping non-Rust file {}", path.display());
     }
     Ok(())
 }
@@ -59,10 +66,12 @@ fn run() -> Result<u8, String> {
     }
     let mut inputs = vec![];
     for path in paths {
-        files(&path, &mut inputs)?;
+        files(&path, &mut inputs, true)?;
     }
     inputs.sort();
-    inputs.dedup();
+    // `src/a.rs` and `./src/a.rs` name the same file.
+    let mut seen = BTreeSet::new();
+    inputs.retain(|p| seen.insert(fs::canonicalize(p).unwrap_or_else(|_| p.clone())));
     if inputs.is_empty() {
         return Err("no Rust source files found".into());
     }

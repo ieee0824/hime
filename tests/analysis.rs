@@ -95,3 +95,146 @@ fn recursive_cycles_are_unknown_and_propagate() {
         [Status::Unknown; 3]
     );
 }
+
+fn report(source: &str, function: &str) -> hime::FunctionReport {
+    analyze_source("test.rs", source)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.function == function)
+        .unwrap_or_else(|| panic!("{function} not reported"))
+}
+fn status_of(source: &str, function: &str) -> Status {
+    report(source, function).status
+}
+
+// Issue #1: calls must resolve the way rustc does, or stay unresolved.
+#[test]
+fn plain_call_in_impl_targets_module_function() {
+    let src = "fn helper() { println!(\"x\"); } struct S; impl S { fn helper() {} fn run() { helper(); } }";
+    assert_eq!(status_of(src, "S::run"), Status::Impure);
+}
+#[test]
+fn outer_function_calls_its_nested_function() {
+    let src = "fn b() {} fn a() { fn b() { println!(\"x\"); } b(); }";
+    assert_eq!(status_of(src, "a"), Status::Impure);
+}
+#[test]
+fn super_above_file_root_is_unresolved() {
+    assert_eq!(
+        status_of("fn f() {} fn g() { super::f(); }", "g"),
+        Status::Unknown
+    );
+}
+#[test]
+fn super_in_impl_skips_only_the_module() {
+    let src = "fn f() { println!(\"x\"); } mod m { fn f() {} struct S; impl S { fn g() { super::f(); } } }";
+    assert_eq!(status_of(src, "m::S::g"), Status::Impure);
+}
+#[test]
+fn self_in_impl_targets_module() {
+    let src = "fn f() { println!(\"x\"); } struct S; impl S { fn f() {} fn g() { self::f(); } }";
+    assert_eq!(status_of(src, "S::g"), Status::Impure);
+}
+#[test]
+fn trait_path_call_is_not_resolved_to_default_body() {
+    let src = "trait T: Sized { fn m(x: Self) -> i32 { 0 } } struct S; impl T for S { fn m(x: Self) -> i32 { println!(\"x\"); 1 } } fn g(s: S) -> i32 { T::m(s) }";
+    assert_eq!(status_of(src, "g"), Status::Unknown);
+}
+#[test]
+fn plain_call_in_trait_default_targets_module() {
+    let src = "fn h() { println!(\"x\"); } trait T { fn h() {} fn d() { h(); } }";
+    assert_eq!(status_of(src, "T::d"), Status::Impure);
+}
+#[test]
+fn super_in_nested_function_skips_function_scopes() {
+    let src = "fn c() { println!(\"x\"); } mod m { fn c() {} fn a() { fn b() { super::c(); } } }";
+    assert_eq!(status_of(src, "m::a::b"), Status::Impure);
+}
+#[test]
+fn explicit_mutable_self_is_impure() {
+    let src = "struct S { v: i32 } impl S { fn m(self: &mut Self) { self.v = 1; } }";
+    assert_eq!(status_of(src, "S::m"), Status::Impure);
+}
+#[test]
+fn nested_functions_see_sibling_block_items() {
+    let src = "fn a() { fn b() { println!(\"x\"); } fn c() { b(); } }";
+    assert_eq!(status_of(src, "a::c"), Status::Impure);
+}
+
+// Issue #2: benign constructs must not be reported.
+#[test]
+fn benign_attributes_and_constructors_are_candidates() {
+    assert_eq!(
+        statuses(
+            "/// doc\n#[inline] #[must_use] fn a(x: i32) -> Option<i32> { Some(x) }
+             struct P(i32); enum E { V(i32) } fn b() -> (P, E, Result<i32, ()>) { (P(1), E::V(2), Ok(3)) }"
+        ),
+        [Status::Candidate; 2]
+    );
+}
+#[test]
+fn std_value_constructors_are_not_effects() {
+    assert_eq!(
+        statuses(
+            "fn a() { let _ = std::time::Duration::from_secs(1); } fn b() { let _ = std::io::Error::other(\"x\"); }"
+        ),
+        [Status::Unknown; 2]
+    );
+    assert_eq!(
+        statuses("fn a() { let _ = std::time::Instant::now(); }"),
+        [Status::Impure]
+    );
+}
+#[test]
+fn only_top_level_mutable_parameters_are_impure() {
+    assert_eq!(
+        statuses(
+            "fn a() -> i32 { let mut v = 0; let r: &mut i32 = &mut v; v } fn b(g: impl Fn(&mut i32)) {}"
+        ),
+        [Status::Unknown, Status::Unknown]
+    );
+}
+#[test]
+fn unreachable_is_treated_like_panic() {
+    assert_eq!(
+        statuses("fn a() { unreachable!() } fn b() { core::panic!() }"),
+        [Status::Impure; 2]
+    );
+}
+
+// Issue #3: coverage and diagnostics.
+#[test]
+fn functions_nested_in_methods_are_reported() {
+    let src = "struct S; impl S { fn m() { fn inner() { println!(\"x\"); } inner(); } }";
+    assert_eq!(status_of(src, "S::m::inner"), Status::Impure);
+    assert_eq!(status_of(src, "S::m"), Status::Impure);
+}
+#[test]
+fn impl_and_trait_attributes_are_unknown() {
+    assert_eq!(
+        statuses("struct S; #[cfg(x)] impl S { fn a() {} } #[async_trait] trait T { fn b() {} }"),
+        [Status::Unknown; 2]
+    );
+}
+#[test]
+fn recursion_points_to_recursive_call() {
+    let r = report("fn leaf() {}\nfn a() {\n    leaf();\n    a();\n}", "a");
+    let d = r
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "recursion")
+        .unwrap();
+    assert_eq!(d.line, 4);
+}
+#[test]
+fn trait_impl_methods_are_named_by_type() {
+    let names: Vec<_> = analyze_source(
+        "t.rs",
+        "struct S; trait T { fn m(); } impl T for S { fn m() {} }",
+    )
+    .unwrap()
+    .into_iter()
+    .map(|r| r.function)
+    .collect();
+    assert_eq!(names, ["T::m", "<S as T>::m"]);
+}
